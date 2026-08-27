@@ -2,7 +2,15 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from bubbles import BubblePopEnv
+from bubbles import (
+    BubblePopEnv,
+    board_move_interval as default_board_move_interval,
+    height_game_map,
+    rounds,
+    start_height as default_start_height,
+    total_colours,
+    width_game_map,
+)
 
 
 MODEL_DIR = Path(__file__).resolve().parent
@@ -14,13 +22,49 @@ def action_mask(env):
     return env.get_action_mask()
 
 
-def build_model_path(total_timesteps, n_steps, tag=None, completed_timesteps=None, average_score=None):
+def build_env_kwargs(args):
+    if args.width <= 0:
+        raise ValueError("--width must be positive")
+
+    if args.height <= 0:
+        raise ValueError("--height must be positive")
+
+    if args.colours <= 0:
+        raise ValueError("--colours must be positive")
+
+    if not (0 <= args.start_height <= args.height):
+        raise ValueError("--start-height must be between 0 and --height")
+
+    return {
+        "width": args.width,
+        "height": args.height,
+        "total_colours": args.colours,
+        "start_height": args.start_height,
+        "max_rounds": args.max_rounds,
+        "board_move_interval": args.board_move_interval,
+    }
+
+
+def build_model_path(
+    total_timesteps,
+    n_steps,
+    env_kwargs,
+    tag=None,
+    completed_timesteps=None,
+    average_score=None
+):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name_parts = [
         MODEL_PREFIX,
         timestamp,
         f"ts{total_timesteps}",
         f"nsteps{n_steps}",
+        f"w{env_kwargs['width']}",
+        f"h{env_kwargs['height']}",
+        f"c{env_kwargs['total_colours']}",
+        f"start{env_kwargs['start_height']}",
+        f"rounds{env_kwargs['max_rounds']}",
+        f"move{env_kwargs['board_move_interval']}",
     ]
 
     if tag is not None:
@@ -36,13 +80,13 @@ def build_model_path(total_timesteps, n_steps, tag=None, completed_timesteps=Non
     return MODEL_DIR / filename
 
 
-def evaluate_model_score(model, uses_action_masks, eval_episodes, seed_start):
+def evaluate_model_score(model, uses_action_masks, eval_episodes, seed_start, env_kwargs):
     scores = []
     round_counts = []
 
     for episode_index in range(eval_episodes):
         seed = seed_start + episode_index
-        env = BubblePopEnv(seed=seed)
+        env = BubblePopEnv(seed=seed, **env_kwargs)
         observation, info = env.reset(seed=seed)
         terminated = False
         truncated = False
@@ -81,7 +125,8 @@ def make_score_evaluation_callback(
     eval_freq,
     eval_episodes,
     eval_seed_start,
-    uses_action_masks
+    uses_action_masks,
+    env_kwargs
 ):
     if eval_freq <= 0 or eval_episodes <= 0:
         return None
@@ -114,7 +159,8 @@ def make_score_evaluation_callback(
                 self.model,
                 uses_action_masks,
                 eval_episodes,
-                eval_seed_start
+                eval_seed_start,
+                env_kwargs
             )
             self.last_eval_timestep = self.num_timesteps
 
@@ -134,6 +180,7 @@ def make_score_evaluation_callback(
                 self.best_model_path = build_model_path(
                     total_timesteps,
                     n_steps,
+                    env_kwargs,
                     tag="best",
                     completed_timesteps=self.num_timesteps,
                     average_score=average_score
@@ -154,12 +201,13 @@ def train_with_maskable_ppo(
     device,
     eval_freq,
     eval_episodes,
-    eval_seed_start
+    eval_seed_start,
+    env_kwargs
 ):
     from sb3_contrib import MaskablePPO
     from sb3_contrib.common.wrappers import ActionMasker
 
-    env = BubblePopEnv()
+    env = BubblePopEnv(**env_kwargs)
     env = ActionMasker(env, action_mask)
     callback = make_score_evaluation_callback(
         total_timesteps,
@@ -167,7 +215,8 @@ def train_with_maskable_ppo(
         eval_freq,
         eval_episodes,
         eval_seed_start,
-        uses_action_masks=True
+        uses_action_masks=True,
+        env_kwargs=env_kwargs
     )
 
     # MultiInputPolicy is used because the observation is a dictionary.
@@ -196,18 +245,20 @@ def train_with_regular_ppo(
     device,
     eval_freq,
     eval_episodes,
-    eval_seed_start
+    eval_seed_start,
+    env_kwargs
 ):
     from stable_baselines3 import PPO
 
-    env = BubblePopEnv()
+    env = BubblePopEnv(**env_kwargs)
     callback = make_score_evaluation_callback(
         total_timesteps,
         n_steps,
         eval_freq,
         eval_episodes,
         eval_seed_start,
-        uses_action_masks=False
+        uses_action_masks=False,
+        env_kwargs=env_kwargs
     )
 
     # Regular PPO can choose invalid actions, so the environment gives those a penalty.
@@ -234,6 +285,21 @@ def print_training_summary(algorithm_name, final_model_path, callback):
         print("best average eval score:", round(callback.best_average_score, 2))
 
 
+def print_environment_summary(env_kwargs):
+    print(
+        "environment:",
+        f"{env_kwargs['width']}x{env_kwargs['height']}",
+        "| colours",
+        env_kwargs["total_colours"],
+        "| start height",
+        env_kwargs["start_height"],
+        "| max rounds",
+        env_kwargs["max_rounds"],
+        "| board move interval",
+        env_kwargs["board_move_interval"]
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--timesteps", type=int, default=25000)
@@ -245,8 +311,16 @@ def main():
     parser.add_argument("--eval-freq", type=int, default=25000)
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--eval-seed-start", type=int, default=1000)
+    parser.add_argument("--width", type=int, default=width_game_map)
+    parser.add_argument("--height", type=int, default=height_game_map)
+    parser.add_argument("--colours", type=int, default=total_colours)
+    parser.add_argument("--start-height", type=int, default=default_start_height)
+    parser.add_argument("--max-rounds", type=int, default=rounds)
+    parser.add_argument("--board-move-interval", type=int, default=default_board_move_interval)
     args = parser.parse_args()
-    model_path = build_model_path(args.timesteps, args.n_steps)
+    env_kwargs = build_env_kwargs(args)
+    model_path = build_model_path(args.timesteps, args.n_steps, env_kwargs)
+    print_environment_summary(env_kwargs)
 
     try:
         callback = train_with_maskable_ppo(
@@ -259,7 +333,8 @@ def main():
             args.device,
             args.eval_freq,
             args.eval_episodes,
-            args.eval_seed_start
+            args.eval_seed_start,
+            env_kwargs
         )
         print_training_summary("MaskablePPO", model_path, callback)
     except ImportError:
@@ -274,7 +349,8 @@ def main():
                 args.device,
                 args.eval_freq,
                 args.eval_episodes,
-                args.eval_seed_start
+                args.eval_seed_start,
+                env_kwargs
             )
             print_training_summary("PPO", model_path, callback)
         except ImportError:
