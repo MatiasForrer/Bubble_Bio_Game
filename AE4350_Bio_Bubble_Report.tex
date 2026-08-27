@@ -1,0 +1,398 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=2.0cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{siunitx}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=black,
+    urlcolor=blue
+}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.55em}
+\setlist[itemize]{leftmargin=1.5em, itemsep=0.15em}
+\setlist[enumerate]{leftmargin=1.7em, itemsep=0.15em}
+
+\title{\textbf{Learning to Play a Bubble Shooter Game with Masked Proximal Policy Optimization}\\
+\large AE4350 Bio-Inspired Intelligence Assignment}
+\author{Student name: \textit{TODO}\\
+Repository: \textit{TODO: add GitHub URL}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report investigates whether a reinforcement learning agent can learn an effective scoring strategy in a custom Bubble Shooter-style computer game. The game was implemented as a Gymnasium-compatible environment with a discrete action space, a staggered hexagonal board, stochastic future bubble colours, group-clearing dynamics, floating-cluster removal, and a scrolling board. The learning agent uses Maskable Proximal Policy Optimization (Maskable PPO), so illegal board cells and physically unreachable shots are removed from the sampled action distribution. The best model selection procedure evaluates intermediate checkpoints on fixed validation seeds and stores a checkpoint whenever the average score improves. On an independent test set of 50 game episodes, the best trained agents strongly outperform a valid-random baseline. The random baseline achieves an average score of \(480.90 \pm 105.95\), while the best one-million-step checkpoint achieves \(1353.10 \pm 215.82\), with 45 wins out of 50 against random valid play. These results show that the agent learned a non-trivial policy for exploiting local colour matches and surviving longer than random play. At the same time, overlapping confidence intervals and differences between validation and test rankings show that checkpoint selection and stochastic variation must be handled carefully.
+\end{abstract}
+
+\section{Introduction}
+
+Reinforcement learning (RL) studies agents that improve their behaviour by interacting with an environment and receiving scalar feedback. This trial-and-error structure makes it a natural member of bio-inspired intelligence: instead of solving a task from a complete analytical model, the agent adapts its policy through repeated interaction and reward feedback. Sutton and Barto describe RL as a framework in which an agent tries to maximize accumulated reward in an uncertain environment \cite{SuttonBarto2018}. The AE4350 assignment explicitly allows computer games as reinforcement learning tasks, because they provide controlled environments in which an agent perceives state, chooses actions, and receives performance feedback.
+
+The present project implements such a task: a simplified Bubble Shooter game called \textit{Bio Bubble}. The agent observes a partly filled bubble board and the next bubble colour, then chooses a board cell in which to place the bubble. Groups of at least three connected bubbles of the same colour are removed, detached floating clusters are removed, and the board scrolls downward every second valid move. The objective is to obtain a high score while preventing bubbles from reaching the bottom row.
+
+The central research question is:
+
+\begin{quote}
+\textit{Can a PPO-based reinforcement learning agent learn a scoring and survival strategy for a custom Bubble Shooter environment, and how sensitive is the result to training budget and model selection?}
+\end{quote}
+
+The contribution is not a new reinforcement learning algorithm. Instead, the contribution is a complete implementation and analysis pipeline: a custom game environment, action masking for legal shots, shaped rewards, automatic checkpoint evaluation, and quantitative comparison against a valid-random baseline. This is appropriate for the assignment because the rubric values a clear method, reproducible implementation, results over multiple runs, parameter sensitivity, and analysis of the learned solution.
+
+\section{Task and Environment}
+
+\subsection{Game Description}
+
+The environment is a discrete single-agent game. The board has height 10 and maximum row width 8. Alternate rows are horizontally shifted and have one fewer valid cell, producing a staggered hexagonal neighbourhood pattern. Each occupied valid cell contains one of three bubble colours. Invalid padding cells are represented internally by \(-1\), empty cells by 0, and coloured bubbles by values 1--3.
+
+At the beginning of an episode, two rows are populated at the top. At each valid step, the current bubble is placed at the selected cell and connected same-colour components are tested. A component of size three or larger is removed. After such removals, all bubbles no longer connected to the top row are considered floating and are removed as well. Every second valid move, the board scrolls downward by deleting the bottom row and adding a new stochastic row at the top. The episode terminates when a bubble reaches the bottom row, when no playable moves remain, or when the maximum round count is reached.
+
+\begin{table}[H]
+\centering
+\caption{Environment constants used in the implemented game.}
+\begin{tabular}{lll}
+\toprule
+Quantity & Value & Role \\
+\midrule
+Board height & 10 rows & Episode state grid height \\
+Maximum row width & 8 cells & Action encoding width \\
+Shifted-row width & 7 cells & Hex-staggered row structure \\
+Bubble colours & 3 & Discrete colour classes \\
+Initial filled rows & 2 & Initial stochastic board population \\
+Maximum rounds & 40 & Time-limit truncation \\
+Board scroll interval & 2 valid moves & Increasing game pressure \\
+Action count & \(10 \times 8 = 80\) & One discrete action per encoded grid cell \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{State, Action and Dynamics}
+
+The environment follows the Gymnasium interface, where an environment defines \texttt{reset()}, \texttt{step()}, action spaces and observation spaces \cite{GymnasiumEnv}. The observation is a dictionary:
+
+\begin{itemize}
+    \item \texttt{grid}: a \(10 \times 8\) integer grid with invalid, empty and coloured cells;
+    \item \texttt{next\_ball}: the colour of the next bubble to be placed;
+    \item \texttt{stagger\_offset}: a binary value specifying which row parity is shifted.
+\end{itemize}
+
+The action is a single discrete integer,
+\[
+    a = y \cdot W + x,
+\]
+where \(W=8\), \(x\) is the encoded column and \(y\) is the row. The environment decodes this into a candidate cell. Not all encoded actions are legal, because some cells are invalid padding cells, some are already occupied, and some are geometrically unreachable from the shooter due to blocking bubbles. The implemented action mask marks only legal target cells as available.
+
+The state transition contains several game-specific rules. First, the agent may only place a bubble in an empty valid cell that touches the ceiling or an existing bubble. Second, the chosen target must have a clear shot path from the shooter, allowing straight shots and a limited number of wall bounces. Third, after a bubble is placed, a flood-fill operation identifies same-colour connected components using the staggered hexagonal neighbourhood. Components of size at least three are removed, followed by removal of floating components.
+
+\subsection{Reward Design}
+
+Two scoring systems are implemented. The human-readable score is used for reporting game performance, while the RL reward is used for learning. The human score rewards popped bubbles, floating clears, large clears, and survival. The RL reward has the same qualitative direction but smaller magnitudes and includes a game-over penalty:
+
+\[
+R =
+-1
++2N_{\mathrm{pop}}
++3N_{\mathrm{float}}
++B(N_{\mathrm{pop}}+N_{\mathrm{float}})
++1.5I_{\mathrm{survive}}
+-25I_{\mathrm{gameover}},
+\]
+where \(B(n)=6\) if \(n\geq 8\), \(B(n)=2.5\) if \(5\leq n<8\), and \(B(n)=0\) otherwise.
+
+\begin{table}[H]
+\centering
+\caption{Reward and score components. The report metrics use the human score, while PPO optimizes the RL reward.}
+\begin{tabular}{lll}
+\toprule
+Event & Human score contribution & RL reward contribution \\
+\midrule
+Valid turn cost & None & \(-1.0\) \\
+Popped bubble & \(+10\) each & \(+2.0\) each \\
+Floating bubble removed & \(+15\) each & \(+3.0\) each \\
+Clear at least 5 bubbles & \(+25\) & \(+2.5\) \\
+Clear at least 8 bubbles & \(+60\) & \(+6.0\) \\
+Survive the move & \(+5\) & \(+1.5\) \\
+Game over & None directly & \(-25.0\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This reward is shaped. It does not merely indicate success or failure, but gives intermediate feedback for useful sub-goals. In this task, reward shaping is pragmatic because sparse terminal reward would make early exploration difficult: most random policies would lose before discovering large clears.
+
+\section{Learning Method}
+
+\subsection{Proximal Policy Optimization}
+
+The agent is trained using Proximal Policy Optimization (PPO), a policy-gradient method introduced by Schulman et al. \cite{Schulman2017}. PPO alternates between collecting trajectories from the current policy and optimizing a clipped surrogate objective. In simplified form, the objective is
+\[
+L^{\mathrm{CLIP}}(\theta)
+=
+\mathbb{E}_{t}
+\left[
+\min
+\left(
+r_t(\theta)\hat{A}_t,\,
+\mathrm{clip}(r_t(\theta),1-\epsilon,1+\epsilon)\hat{A}_t
+\right)
+\right],
+\]
+where \(r_t(\theta)\) is the probability ratio between the new and old policy, \(\hat{A}_t\) is an advantage estimate, and \(\epsilon\) limits the policy update. This clipping discourages excessively large policy updates while still permitting multiple epochs of minibatch optimization on collected data.
+
+The implementation uses Stable-Baselines3 and SB3-Contrib. Stable-Baselines3 provides PPO hyperparameters such as learning rate, rollout length \texttt{n\_steps}, minibatch size and optimization epochs \cite{SB3PPO}. SB3-Contrib provides Maskable PPO, which extends PPO with invalid action masking \cite{SB3MaskablePPO}.
+
+\subsection{Invalid Action Masking}
+
+Action masking is central to this task. The encoded action space has 80 actions, but many are invalid in a given state. A standard PPO policy could spend substantial exploration probability on impossible actions. Masking sets the probability of illegal actions to zero before sampling. Huang and Ontanon analyse invalid action masking in policy-gradient algorithms and show why it is particularly useful when many actions are invalid \cite{HuangOntanon2020}.
+
+In this implementation, \texttt{get\_action\_mask()} computes a Boolean mask over all 80 encoded actions. A cell is legal only if it is inside the current staggered row, empty, connected to the ceiling or existing bubbles, and reachable by the shot-visibility test. During training, \texttt{ActionMasker} supplies this mask to Maskable PPO. During evaluation and watching, the same mask is passed to deterministic \texttt{model.predict}.
+
+\subsection{Checkpoint Evaluation}
+
+A key empirical issue was that longer training did not always produce a better final saved policy. PPO is stochastic, and the final policy at the end of a run may be worse than an earlier checkpoint. To address this, the training script now performs deterministic validation every 25,000 timesteps over 10 fixed validation episodes. Whenever the validation average score improves, the current model is saved with a filename containing the total training budget, rollout length, checkpoint step and validation average score. This creates files such as:
+
+\begin{quote}
+\texttt{bubble\_pop\_model\_20260826\_122943\_ts1000000\_nsteps512\_best\_step950000\_avg1584.zip}
+\end{quote}
+
+This procedure separates two concepts: the \textit{final model}, saved at the end of training, and the \textit{best validation checkpoint}, saved at the best observed validation point.
+
+\section{Experimental Setup}
+
+\subsection{Training Configuration}
+
+All trained agents used Maskable PPO with a dictionary observation policy. The main training configuration is shown in Table~\ref{tab:hyperparams}. Earlier tests used 250,000 and 500,000 timesteps. The strongest run used a one-million-step budget and checkpoint evaluation.
+
+\begin{table}[H]
+\centering
+\caption{Main Maskable PPO training configuration.}
+\label{tab:hyperparams}
+\begin{tabular}{lll}
+\toprule
+Parameter & Value & Reason \\
+\midrule
+Algorithm & Maskable PPO & Handles invalid action masks \\
+Policy & MultiInputPolicy & Supports dictionary observations \\
+Timesteps & 250k, 500k, 1M & Training-budget sensitivity \\
+\texttt{n\_steps} & 512 & Rollout length before PPO update \\
+\texttt{batch\_size} & 128 & Minibatch size for optimization \\
+\texttt{n\_epochs} & 10 & Optimization passes per rollout \\
+Learning rate & \(3\times10^{-4}\) & Standard PPO-scale learning rate \\
+Device & CPU & Reproducible local training setup \\
+Validation frequency & 25,000 timesteps & Periodic checkpoint selection \\
+Validation episodes & 10 & Lightweight repeated validation \\
+Validation seeds & 1000--1009 & Fixed model-selection episodes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The main one-million-step command was:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe train_agent.py --timesteps 1000000
+  --n-steps 512 --batch-size 128 --n-epochs 10
+  --learning-rate 0.0003 --device cpu
+  --eval-freq 25000 --eval-episodes 10
+\end{verbatim}
+
+\subsection{Evaluation Protocol}
+
+The final reported test results use independent seeds 2000--2049, which were not used for checkpoint selection. This is important because validation checkpoints are selected using seeds 1000--1009; evaluating only on those seeds would overestimate generalization. For each model, 50 deterministic episodes were run. The random baseline was not allowed to choose invalid actions; it sampled uniformly from the valid action mask. This makes the baseline stronger and fairer than a naive random policy that wastes moves on illegal cells.
+
+For each condition, the following statistics are reported:
+
+\begin{itemize}
+    \item mean score and 95\% confidence interval;
+    \item median score;
+    \item standard deviation, minimum and maximum score;
+    \item mean number of survived rounds;
+    \item wins out of 50 against the valid-random baseline on matching seeds.
+\end{itemize}
+
+The 95\% confidence interval is computed as
+\[
+\bar{x} \pm 1.96\frac{s}{\sqrt{n}},
+\]
+where \(\bar{x}\) is the mean score, \(s\) is the sample standard deviation and \(n=50\).
+
+\section{Results}
+
+\subsection{Independent Test Performance}
+
+Table~\ref{tab:test-results} shows the independent test results. All PPO agents outperform the valid-random baseline by a large margin. The random policy achieved an average score of \(480.90\), while trained agents ranged from \(980.60\) to \(1357.90\). The best one-million-step checkpoint achieved \(1353.10\), won 45 out of 50 seed-matched comparisons against random, and survived 25.40 rounds on average.
+
+\begin{table}[H]
+\centering
+\caption{Out-of-sample evaluation on 50 independent test episodes, seeds 2000--2049. The confidence interval is 95\% for the mean score.}
+\label{tab:test-results}
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Policy & Mean & CI95 & Median & Std. & Min & Max & Rounds & Wins \\
+\midrule
+Valid random & 480.90 & 105.95 & 392.50 & 382.22 & 40 & 1460 & 15.10 & -- \\
+PPO 250k final & 980.60 & 197.26 & 710.00 & 711.64 & 165 & 3175 & 21.10 & 42 \\
+PPO 500k final A & \textbf{1357.90} & 198.28 & \textbf{1340.00} & 715.34 & 250 & 2975 & \textbf{25.86} & 43 \\
+PPO 500k final B & 1109.20 & 191.33 & 957.50 & 690.26 & 135 & 2670 & 22.80 & 42 \\
+PPO 500k best checkpoint & 1083.70 & 160.44 & 972.50 & 578.80 & 160 & 2725 & 21.98 & 43 \\
+PPO 1M final & 1278.50 & 237.31 & 1087.50 & 856.13 & 90 & 3085 & 24.04 & 42 \\
+PPO 1M best checkpoint & 1353.10 & 215.82 & 1140.00 & 778.63 & 205 & 2905 & 25.40 & \textbf{45} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results support the main hypothesis: Maskable PPO learns a useful policy. Even the weakest trained policy more than doubles the average score of the valid-random baseline. The improvement is also visible in survival time: the random baseline survives 15.10 rounds on average, whereas the strongest trained policies survive about 25--26 rounds.
+
+However, the exact ranking of the strongest agents is less certain. The 500k final A and 1M best checkpoint have nearly identical mean scores on the independent test set, and their confidence intervals overlap substantially. The best interpretation is therefore not that one policy is conclusively superior to the other, but that both represent a substantially learned strategy. The 1M best checkpoint is still valuable because it had the highest validation score and the highest number of wins against random in the independent test.
+
+\subsection{Validation Checkpoint Progression}
+
+Table~\ref{tab:checkpoint-progression} shows the best validation checkpoints saved during the one-million-step run. The validation average improves from 719 at 25k steps to 1584 at 950k steps. This shows that longer training can discover substantially stronger policies, even though the final policy at the end of training is not always the best observed one.
+
+\begin{table}[H]
+\centering
+\caption{Best-checkpoint progression during the one-million-step run. Validation used 10 fixed episodes.}
+\label{tab:checkpoint-progression}
+\begin{tabular}{rr}
+\toprule
+Training step & Best validation average score \\
+\midrule
+25,000 & 719 \\
+75,000 & 846 \\
+100,000 & 1108 \\
+175,000 & 1113 \\
+350,000 & 1304 \\
+525,000 & 1323 \\
+725,000 & 1332 \\
+775,000 & 1342 \\
+800,000 & 1364 \\
+850,000 & 1394 \\
+925,000 & 1418 \\
+950,000 & \textbf{1584} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Sensitivity Analysis}
+
+\subsection{Training Budget}
+
+The clearest sensitivity dimension is the number of training timesteps. Moving from 250k to the stronger 500k and 1M policies improves average test score from \(980.60\) to approximately \(1350\). The one-million-step run also produced a validation curve with continued improvement until step 950k. This indicates that the learning process had not saturated at 250k steps.
+
+The result is not monotonic if only final policies are considered. A 500k final policy trained before checkpointing performed worse in an earlier 20-episode benchmark than the 250k model, while a later 500k final policy performed very well on the 50-episode independent test. This variation is expected in policy-gradient training, where the optimization path depends on stochastic rollouts and gradient estimates.
+
+\subsection{Checkpoint Selection}
+
+Checkpoint selection is a second important sensitivity. During the one-million-step run, the final model scored \(1278.50\) on the independent test, whereas the best validation checkpoint scored \(1353.10\). This is a gain of 74.60 average score points on the independent test. In the earlier 20-seed comparison, the gain from best checkpointing was even larger. Therefore, saving only the final model is not reliable enough for this task.
+
+At the same time, the 500k best checkpoint did not outperform the strongest 500k final model on the independent test. This illustrates a normal validation-test distinction: a checkpoint selected on 10 validation episodes can overfit to those exact validation seeds. The correct conclusion is that checkpointing is useful, but final claims must still be based on independent test seeds.
+
+\subsection{Run-to-Run Variation}
+
+Two 500k final models trained under similar hyperparameters achieved different independent test means: \(1357.90\) and \(1109.20\). This is not a code error; it reflects the stochasticity of PPO training and the stochastic initial game boards. From a scientific reporting perspective, this means that a single training run should not be treated as a precise estimate of algorithm performance. The report therefore uses multiple evaluation episodes and confidence intervals.
+
+\subsection{Remaining Sensitivity Limitation}
+
+The current implementation exposes \texttt{n\_steps}, batch size, learning rate and number of epochs, but the completed long runs mainly vary training budget and model-selection strategy. A stronger final study would add at least one additional hyperparameter sweep, for example \(\texttt{n\_steps}=128\) versus \(\texttt{n\_steps}=512\), or learning rate \(10^{-4}\) versus \(3\cdot10^{-4}\). This limitation should be addressed before submission if time permits. The existing results are nevertheless sufficient to demonstrate learning, because all trained policies substantially exceed a valid-random baseline on independent seeds.
+
+\section{Analysis of the Learned Solution}
+
+Qualitative inspection of deterministic agent rollouts suggests that the learned policy is not merely choosing arbitrary legal positions. Compared with valid-random play, the trained policy more often places bubbles where immediate same-colour matches are possible and avoids quickly extending the board downward. It also sometimes creates or exploits floating clears, which are valuable because floating bubbles receive a larger reward than directly popped bubbles.
+
+The learned behaviour appears mostly local and opportunistic. This is plausible because the observation contains the current grid and next bubble only; the agent cannot observe future colours beyond the next shot. The agent can therefore learn heuristics such as:
+
+\begin{itemize}
+    \item prefer placements adjacent to same-colour groups;
+    \item avoid isolated placements that do not create clearing potential;
+    \item maintain playable positions near the upper part of the board;
+    \item exploit reachable side and wall-bounce placements when they clear bubbles.
+\end{itemize}
+
+The results support this interpretation. The trained agents survive around 25 rounds instead of 15 for the random baseline, showing improved board management. The best policies also have much higher median scores, which indicates consistent improvement rather than only rare lucky games.
+
+The main weakness is long-horizon planning. Some episodes still end with low scores, as shown by minimum scores between 90 and 250 for the trained agents. This suggests that the learned policy can still make locally reasonable moves that later produce poor board states. A richer agent could include additional lookahead, value-based search, curriculum learning, or training with more diverse board sizes.
+
+\section{Verification and Reproducibility}
+
+Several implementation checks were used to reduce the chance that the result is caused by an environment bug:
+
+\begin{itemize}
+    \item smoke checks verify staggered row offsets and alternating row widths;
+    \item popping tests verify same-colour group removal;
+    \item floating-ball tests verify detached-cluster removal;
+    \item invalid-action tests verify that illegal cells are rejected;
+    \item board-shape and board-scroll tests verify stable grid dimensions;
+    \item visibility tests verify that blocked targets are not marked playable.
+\end{itemize}
+
+The project can be reproduced with the following sequence:
+
+\begin{enumerate}
+    \item install the required Python packages: \texttt{gymnasium}, \texttt{stable-baselines3}, and \texttt{sb3-contrib};
+    \item run smoke checks with \texttt{python smoke\_checks.py};
+    \item train with the command in Section 4.1;
+    \item watch the best model with \texttt{python watch\_agent.py};
+    \item evaluate trained policies on held-out seeds, using deterministic predictions and action masks.
+\end{enumerate}
+
+For GitHub submission, the repository should include the source code, trained model files or clear instructions for reproducing them, this report, and a short README with installation and run commands.
+
+\section{Conclusion}
+
+This project implemented a custom Bubble Shooter environment and trained a Maskable PPO agent to play it. The environment has non-trivial discrete dynamics: staggered hexagonal adjacency, stochastic new rows, legal-shot constraints, group popping, floating-cluster removal and increasing board pressure. Action masking is essential because many encoded actions are illegal in a given state.
+
+The trained agents clearly outperform valid-random play. On 50 independent test episodes, valid random play achieved an average score of \(480.90\), while the best trained policies achieved approximately \(1350\). The one-million-step best checkpoint won 45 out of 50 matched comparisons against random and survived roughly ten more rounds on average. The results therefore demonstrate that the agent learned a useful scoring and survival strategy.
+
+The analysis also shows why careful reporting matters. Longer training improved the best validation checkpoint, but final checkpoints were not always best. A held-out test set was necessary because validation-selected checkpoints can rank differently out of sample. The main remaining limitation is that only a limited hyperparameter sensitivity analysis was completed. A final extension should vary rollout length or learning rate, but the current evidence is already strong enough to support the central claim: Maskable PPO can learn effective play in the implemented Bio Bubble game.
+
+\begin{thebibliography}{9}
+
+\bibitem{SuttonBarto2018}
+R. S. Sutton and A. G. Barto.
+\newblock \textit{Reinforcement Learning: An Introduction}, second edition.
+\newblock MIT Press, 2018.
+\newblock \url{https://mitpress.mit.edu/9780262039246/reinforcement-learning/}
+
+\bibitem{Schulman2017}
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov.
+\newblock Proximal Policy Optimization Algorithms.
+\newblock arXiv:1707.06347, 2017.
+\newblock \url{https://doi.org/10.48550/arXiv.1707.06347}
+
+\bibitem{HuangOntanon2020}
+S. Huang and S. Ontanon.
+\newblock A Closer Look at Invalid Action Masking in Policy Gradient Algorithms.
+\newblock arXiv:2006.14171, 2020.
+\newblock \url{https://arxiv.org/abs/2006.14171}
+
+\bibitem{GymnasiumEnv}
+Farama Foundation.
+\newblock Gymnasium Env API documentation.
+\newblock \url{https://gymnasium.farama.org/api/env/}
+
+\bibitem{SB3PPO}
+Stable-Baselines3.
+\newblock PPO documentation.
+\newblock \url{https://stable-baselines3.readthedocs.io/en/v2.5.0/modules/ppo.html}
+
+\bibitem{SB3MaskablePPO}
+Stable-Baselines3 Contrib.
+\newblock Maskable PPO documentation.
+\newblock \url{https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html}
+
+\bibitem{AE4350Assignment}
+TU Delft AE4350 course team.
+\newblock AE4350 Assignment Description 2025.
+\newblock Local assignment PDF supplied with the project.
+
+\end{thebibliography}
+
+\end{document}
