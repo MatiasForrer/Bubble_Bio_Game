@@ -418,7 +418,12 @@ def calculate_rl_reward(popped_balls, floating_balls, survived, game_over):
 
 def format_game_map(game_map, stagger_offset):
     lines = []
-    lines.append("0 = empty, 1-" + str(total_colours) + " = ball colours, rows alternate 9/10 cells")
+    width = game_map.shape[1]
+    lines.append(
+        "0 = empty, 1-"
+        + str(total_colours)
+        + f" = ball colours, rows alternate {width - 1}/{width} cells"
+    )
     lines.append("      " + "   ".join(str(x) for x in range(game_map.shape[1])))
 
     for y in range(game_map.shape[0]):
